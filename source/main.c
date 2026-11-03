@@ -39,6 +39,7 @@
 #include "pthr.h"
 #include "net_shim.h"
 #include "prefs.h"
+#include "save_manager.h"
 
 static void *heap_so_base = NULL;
 static size_t heap_so_limit = 0;
@@ -163,7 +164,12 @@ static struct {
   void *(*ccFileUtils)(void);                       // CCFileUtils::sharedFileUtils()
   void (*ccAddSearchPath)(void *self, const char *); // ::addSearchPath(const char*)
   void *(*gmSharedState)(void);                     // GameManager::sharedState()
-  void (*gmDoQuickSave)(void *self);                // GameManager::doQuickSave()
+  void (*gmDoQuickSave)(void *self);                // original working save entry
+  void *(*localSharedState)(void);
+  int (*managerSave)(void *self, int background);
+  void (*managerSaveLegacy)(void *self);
+  void (*managerWaitForSave)(void *self, double timeout);
+  void *(*ccDirector)(void);
   void (*init)(void *env, void *thiz, int w, int h);
   void (*render)(void *env, void *thiz);
   void (*onPause)(void *env, void *thiz);
@@ -190,8 +196,13 @@ static int (*game_JNI_OnLoad)(void *vm, void *reserved);
 static void resolve_gd_exports(void) {
   RESOLVE(ccFileUtils,     "_ZN7cocos2d11CCFileUtils15sharedFileUtilsEv");
   RESOLVE(ccAddSearchPath, "_ZN7cocos2d11CCFileUtils13addSearchPathEPKc");
-  RESOLVE_OPT(gmSharedState, "_ZN11GameManager11sharedStateEv");
-  RESOLVE_OPT(gmDoQuickSave, "_ZN11GameManager11doQuickSaveEv");
+  RESOLVE(gmSharedState, "_ZN11GameManager11sharedStateEv");
+  RESOLVE(gmDoQuickSave, "_ZN11GameManager11doQuickSaveEv");
+  RESOLVE(localSharedState, "_ZN17LocalLevelManager11sharedStateEv");
+  RESOLVE_OPT(managerSave, "_ZN8GManager4saveEb");
+  RESOLVE_OPT(managerSaveLegacy, "_ZN8GManager4saveEv");
+  RESOLVE_OPT(managerWaitForSave, "_ZN8GManager11waitForSaveEd");
+  RESOLVE(ccDirector, "_ZN7cocos2d10CCDirector14sharedDirectorEv");
   RESOLVE(init,          "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeInit");
   RESOLVE(render,        "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeRender");
   RESOLVE(onPause,       "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeOnPause");
@@ -523,18 +534,66 @@ static void update_input(void) {
 
 static AppletHookCookie s_applet_hook;
 static int s_app_focused = 1;
+static int s_play_layer_offset = -1;
+static int s_running_scene_offset = -1;
+static int s_menu_ready;
 
-// GD only saves on background/quit, which is unreliable on Switch; call its
-// own quick-save directly.
-static void force_save(void) {
-  if (gd.gmSharedState && gd.gmDoQuickSave) {
-    void *gm = gd.gmSharedState();
-    if (gm)
-      gd.gmDoQuickSave(gm);
+static uint64_t save_clock_ms(void) {
+  return armGetSystemTick() / (armGetSystemTickFreq() / 1000);
+}
+
+static int menu_save_state(void) {
+  if (!gd.gmSharedState || !gd.ccDirector || s_play_layer_offset < 0 || s_running_scene_offset < 0)
+    return 0;
+  void *director = gd.ccDirector(), *scene = NULL;
+  if (!director)
+    return 0;
+  memcpy(&scene, (const char *)director + s_running_scene_offset, sizeof scene);
+  if (!scene)
+    return 0;
+  int tag = -1;
+  memcpy(&tag, (const char *)scene + 28, sizeof tag);
+  if (tag == 15) // MenuLayer::scene: game loading has finished
+    s_menu_ready = 1;
+  if (!s_menu_ready || tag < 0)
+    return 0;
+  if (tag == 5 || tag == 6) // PlayLayer / LevelEditorLayer, including pause overlays
+    return -1;
+  void *manager = gd.gmSharedState();
+  if (!manager)
+    return 0;
+  void *play = NULL;
+  memcpy(&play, (const char *)manager + s_play_layer_offset, sizeof play);
+  return play ? -1 : 1;
+}
+
+static void save_game_state(void *manager) {
+  // Restore the same GameManager::doQuickSave path used by the working
+  // periodic saver. Wait before and after so a previous writer cannot make
+  // this snapshot get skipped, and the menu checkpoint is durable on return.
+  if (gd.managerWaitForSave)
+    gd.managerWaitForSave(manager, 30.0);
+  gd.gmDoQuickSave(manager);
+  if (gd.managerWaitForSave)
+    gd.managerWaitForSave(manager, 30.0);
+  void *local = gd.localSharedState ? gd.localSharedState() : NULL;
+  if (local) {
+    if (gd.managerWaitForSave)
+      gd.managerWaitForSave(local, 30.0);
+    if (gd.managerSave)
+      gd.managerSave(local, 1);
+    else if (gd.managerSaveLegacy)
+      gd.managerSaveLegacy(local);
+    if (gd.managerWaitForSave)
+      gd.managerWaitForSave(local, 30.0);
   }
 }
 
-// pause/resume + save on focus change (HOME), like Android onPause/onResume
+static int save_commit_storage(void) {
+  return (int)fsdevCommitDevice("sdmc");
+}
+
+// Best-effort pause/resume notifications. HOME is not a save trigger.
 static void applet_focus_hook(AppletHookType type, void *param) {
   (void)param;
   if (type != AppletHookType_OnFocusState)
@@ -546,8 +605,18 @@ static void applet_focus_hook(AppletHookType type, void *param) {
   } else if (!focused && s_app_focused) {
     s_app_focused = 0;
     gd.onPause(fake_env, NULL);
-    force_save();
   }
+}
+
+static void save_lifecycle_init(void) {
+  SaveBackend backend = {
+    gd.gmSharedState, save_game_state, menu_save_state, save_clock_ms,
+    save_commit_storage
+  };
+  unsigned interval = config.menu_autosave_interval_seconds > 0 ?
+      (unsigned)config.menu_autosave_interval_seconds : 0;
+  save_manager_init(&backend, interval);
+  appletHook(&s_applet_hook, applet_focus_hook, NULL);
 }
 
 int main(int argc, char **argv) {
@@ -595,6 +664,8 @@ int main(int argc, char **argv) {
   so_resolve(&game_mod, dynlib_functions, dynlib_numfunctions, 1);
 
   game_compat_apply_network(&game_mod);
+  s_play_layer_offset = game_compat_play_layer_offset(&game_mod);
+  s_running_scene_offset = game_compat_running_scene_offset(&game_mod);
   fmod_hooks_init(&fmod_mod);
   resolve_gd_exports();
 
@@ -651,22 +722,26 @@ int main(int argc, char **argv) {
 
   cpu_boost(0);
 
-  appletHook(&s_applet_hook, applet_focus_hook, NULL);
+  save_lifecycle_init();
 
-  // Forced save work can stall rendering/physics while FMOD keeps playing.
-  // Keep saves in the focus-loss and clean-exit paths, outside gameplay.
+  // Checkpoint only in non-gameplay menus. Do it before presentation, which
+  // can block when HOME opens, preventing the next applet-message poll.
   while (appletMainLoop() && !g_quit) {
+    if (!s_app_focused) {
+      svcSleepThread(16000000);
+      continue;
+    }
     update_input();
     gd.render(fake_env, NULL);
     cursor_render();
+    save_manager_poll();
     eglSwapBuffers(s_dpy, s_surf);
   }
 
-  if (s_app_focused) { // clean in-game quit; background path already saved
+  if (s_app_focused) { // best-effort clean in-game quit
     gd.onPause(fake_env, NULL);
-    force_save();
+    save_manager_force();
   }
-  svcSleepThread(200000000ull); // 200 ms for save writes on worker threads
 
   eglMakeCurrent(s_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
   eglDestroyContext(s_dpy, s_ctx);

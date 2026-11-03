@@ -29,6 +29,7 @@ typedef struct {
   size_t guard_size;
   int32_t sched_policy;
   int32_t sched_priority;
+  int32_t detached;         // wrapper-owned bionic detach state
 } pthread_attr_t_bionic;
 
 // Bionic's LP64 mutex (40 bytes) / cond (48) storage carries {real_ptr,
@@ -41,6 +42,7 @@ typedef struct { pthread_cond_t  *real_ptr; uint32_t magic; } pthread_cond_t_bio
 int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr, void *(*start)(void *), void *param);
 int pthread_join_soloader(pthread_t thread, void **value_ptr);
 int pthread_detach_soloader(pthread_t thread);
+void pthread_exit_soloader(void *value) __attribute__((noreturn));
 int pthread_equal_soloader(pthread_t t1, pthread_t t2);
 pthread_t pthread_self_soloader(void);
 int pthread_once_soloader(volatile int *once_control, void (*init_routine)(void));

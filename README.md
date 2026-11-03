@@ -61,6 +61,9 @@ a forwarder.
 * `screen_width` / `screen_height` — render resolution; `-1` auto-picks
   1280x720 handheld / 1920x1080 docked.
 * `cursor_speed` — pointer speed of the stick-driven cursor, px/s at 720p.
+* `menu_autosave_interval_seconds` — menu save cooldown, **30** seconds by
+  default; `0` disables menu autosaves. Old `autosave_interval_seconds` entries
+  are ignored so older test configurations use the new menu-only default.
 
 ### Controls and saves
 
@@ -69,9 +72,18 @@ after the cursor fades out; it sends one touch, not an extra bottom-right tap.
 **L/R/ZL/ZR** retain the dedicated jump touch. D-pad left/right retain the
 platformer movement zones, and **B/Plus** go back or pause.
 
-The wrapper saves when losing focus (for example, pressing HOME) and on a clean
-in-game exit. It no longer forces a save every 20 seconds during
-rendering. Use HOME to trigger a save before closing the application.
+The wrapper uses the original `GameManager::doQuickSave` entry point. The first
+checkpoint waits at least 30 seconds after startup; further saves run at most
+once every 30 seconds while a menu is open. A save due during a level waits
+until you return to a menu. Pause overlays, the level editor, loading screens,
+and transitions do not trigger autosaves.
+Detached native save workers are reclaimed after they finish. Both progress
+and local-level writers are awaited before the next frame is presented.
+A clean in-game quit also requests a final checkpoint.
+
+HOME does not trigger a save. Before closing, return to a menu and allow the
+30-second cooldown to pass. Keep the same game folder so its `save/` directory
+is reused.
 
 ### Online features
 

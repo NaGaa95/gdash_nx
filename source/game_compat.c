@@ -84,6 +84,45 @@ static uintptr_t bl_target(uintptr_t pc, uint32_t instruction) {
   return (uintptr_t)((int64_t)pc + immediate * 4);
 }
 
+int game_compat_play_layer_offset(so_module *mod) {
+  uintptr_t address = so_try_find_addr(mod, "_ZN11AppDelegate9pauseGameEv");
+  uintptr_t shared = so_try_find_addr(mod, "_ZN11GameManager11sharedStateEv");
+  if (!address || !shared)
+    return -1;
+  const uint32_t *code = (const uint32_t *)address;
+  for (unsigned i = 0; i + 1 < 24; i++) {
+    if (!is_bl(code[i]) || bl_target((uintptr_t)&code[i], code[i]) != shared)
+      continue;
+    // ldr x0, [x0, #offset], immediately after sharedState(). Both known
+    // layouts use the same pointer repeatedly in this bounded routine.
+    if ((code[i + 1] & 0xffc003ffu) != 0xf9400000u)
+      continue;
+    unsigned offset = ((code[i + 1] >> 10) & 0xfffu) * 8;
+    if (offset == 472 || offset == 544)
+      return (int)offset;
+  }
+  return -1;
+}
+
+int game_compat_running_scene_offset(so_module *mod) {
+  uintptr_t address = so_try_find_addr(mod, "_ZN11AppDelegate9pauseGameEv");
+  uintptr_t shared = so_try_find_addr(mod, "_ZN7cocos2d10CCDirector14sharedDirectorEv");
+  if (!address || !shared)
+    return -1;
+  const uint32_t *code = (const uint32_t *)address;
+  for (unsigned i = 0; i + 3 < 10; i++) {
+    if (!is_bl(code[i]) || bl_target((uintptr_t)&code[i], code[i]) != shared ||
+        (code[i + 1] & 0xffc003ffu) != 0xf9400000u ||
+        (code[i + 2] & 0xff00001fu) != 0xb4000000u ||
+        code[i + 3] != 0xb9401c00u) // ldr w0, [scene, #28] (CCNode tag)
+      continue;
+    unsigned offset = ((code[i + 1] >> 10) & 0xfffu) * 8;
+    if (offset == 264 || offset == 272)
+      return (int)offset;
+  }
+  return -1;
+}
+
 static int hex_digit_value(unsigned char digit) {
   if (digit >= '0' && digit <= '9')
     return digit - '0';

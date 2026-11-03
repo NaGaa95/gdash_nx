@@ -27,7 +27,8 @@
 // TPIDR_EL0, which libnx leaves pointing at read-only/zero storage. Each game
 // thread gets a small zeroed block installed in TPIDR_EL0 so those loads (and
 // any other bionic TLS-relative reads) land on valid, writable memory. The
-// block is intentionally leaked: it must stay live for the thread's lifetime.
+// Main/external threads keep it for their lifetime; wrapped pthreads release
+// their block only after the SDK has joined the exited thread.
 // ---------------------------------------------------------------------------
 
 void pthr_install_fake_tls(void) {
@@ -52,9 +53,17 @@ static Mutex init_lock;
 
 static int attr_static_init(pthread_attr_t_bionic *attr) {
   if (attr->magic != 0x42424242) {
-    attr->magic = 0x42424242;
     attr->real_ptr = malloc(sizeof(pthread_attr_t));
-    return pthread_attr_init(attr->real_ptr);
+    if (!attr->real_ptr)
+      return ENOMEM;
+    int ret = pthread_attr_init(attr->real_ptr);
+    if (ret) {
+      free(attr->real_ptr);
+      attr->real_ptr = NULL;
+      return ret;
+    }
+    attr->detached = 0;
+    attr->magic = 0x42424242;
   }
   return 0;
 }
@@ -193,49 +202,198 @@ void pthr_pin_worker_core(void) {
 // thread creation (installs the fake TLS before running game code)
 // ---------------------------------------------------------------------------
 
-typedef struct {
+// libnx provides joinable pthreads but its pthread_detach returns ENOSYS.
+// libc++ treats that error as fatal. Keep SDK threads joinable and let one
+// sleeping reaper join finished detached workers and reclaim their stack/TLS.
+// No game work or save serialization runs on the reaper.
+#define THREAD_JOINABLE 0
+#define THREAD_DETACHED 1
+#define THREAD_JOINING 2
+
+typedef struct ThreadStart {
   void *(*start)(void *);
   void *arg;
+  pthread_t thread;
+  void *fake_tls;
+  int state, finished;
+  struct ThreadStart *next;
 } ThreadStart;
 
-static void *thread_trampoline(void *p) {
-  ThreadStart s = *(ThreadStart *)p;
-  free(p);
-  pthr_install_fake_tls();
+static pthread_mutex_t thread_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t thread_cond = PTHREAD_COND_INITIALIZER;
+static ThreadStart *threads;
+static int reaper_started;
+
+static ThreadStart *find_thread(pthread_t thread) {
+  for (ThreadStart *s = threads; s; s = s->next)
+    if (pthread_equal(s->thread, thread))
+      return s;
+  return NULL;
+}
+
+static void release_thread(ThreadStart *s) {
+  pthread_mutex_lock(&thread_lock);
+  ThreadStart **link = &threads;
+  while (*link && *link != s)
+    link = &(*link)->next;
+  if (*link)
+    *link = s->next;
+  pthread_mutex_unlock(&thread_lock);
+  free(s->fake_tls); // SDK thread has exited, including any TLS destructors.
+  free(s);
+}
+
+static void *thread_reaper(void *unused) {
+  (void)unused;
   assign_core_bg();
-  return s.start(s.arg);
+  pthread_mutex_lock(&thread_lock);
+  for (;;) {
+    ThreadStart *s;
+    for (s = threads; s; s = s->next)
+      if (s->state == THREAD_DETACHED && s->finished)
+        break;
+    if (!s) {
+      pthread_cond_wait(&thread_cond, &thread_lock);
+      continue;
+    }
+    s->state = THREAD_JOINING;
+    pthread_mutex_unlock(&thread_lock);
+    // Join only workers that finished their game callback. A long-lived
+    // detached worker cannot prevent completed save workers being reclaimed.
+    if (pthread_join(s->thread, NULL) == 0)
+      release_thread(s);
+    // If the SDK unexpectedly fails to join, retain its storage rather than
+    // freeing a possibly live stack/TLS. The record remains THREAD_JOINING.
+    pthread_mutex_lock(&thread_lock);
+  }
+  return NULL;
+}
+
+static int ensure_reaper(void) { // thread_lock held
+  if (reaper_started)
+    return 0;
+  pthread_t reaper;
+  int ret = pthread_create(&reaper, NULL, thread_reaper, NULL);
+  if (!ret)
+    reaper_started = 1;
+  return ret;
+}
+
+static void finish_thread(ThreadStart *s) {
+  pthread_mutex_lock(&thread_lock);
+  s->finished = 1;
+  pthread_cond_signal(&thread_cond);
+  pthread_mutex_unlock(&thread_lock);
+}
+
+static void *thread_trampoline(void *p) {
+  ThreadStart *s = p;
+  pthr_install_fake_tls();
+  s->fake_tls = armGetTlsRw();
+  assign_core_bg();
+  void *value = s->start(s->arg);
+  finish_thread(s);
+  return value;
 }
 
 int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr,
                             void *(*start)(void *), void *param) {
-  ThreadStart *s = malloc(sizeof(*s));
+  if (!thread || !start)
+    return EINVAL;
+  ThreadStart *s = calloc(1, sizeof(*s));
+  if (!s)
+    return ENOMEM;
   s->start = start;
   s->arg = param;
 
   pthread_attr_t a;
-  pthread_attr_init(&a);
-  // FMOD's mixer and the game's loaders are fine with 512k on Android, but
-  // recursion depth is cheap to buy here; keep 2 MB unless the game asks big
-  pthread_attr_setstacksize(&a, 2 * 1024 * 1024);
-  if (attr) {
-    attr_static_init((pthread_attr_t_bionic *)attr);
-    size_t want = 0;
-    if (attr->real_ptr && pthread_attr_getstacksize(attr->real_ptr, &want) == 0 &&
-        want > 2 * 1024 * 1024)
-      pthread_attr_setstacksize(&a, want);
+  int ret = pthread_attr_init(&a);
+  if (ret) {
+    free(s);
+    return ret;
   }
-
-  int ret = pthread_create(thread, &a, thread_trampoline, s);
+  // Keep the existing 2 MiB minimum for Android game/FMOD callbacks.
+  size_t stack_size = 2 * 1024 * 1024;
+  if (attr) {
+    ret = attr_static_init((pthread_attr_t_bionic *)attr);
+    if (!ret) {
+      size_t want = 0;
+      if (pthread_attr_getstacksize(attr->real_ptr, &want) == 0 && want > stack_size)
+        stack_size = want;
+      s->state = attr->detached ? THREAD_DETACHED : THREAD_JOINABLE;
+    }
+  }
+  if (!ret)
+    ret = pthread_attr_setstacksize(&a, stack_size);
+  if (!ret) {
+    pthread_mutex_lock(&thread_lock);
+    if (s->state == THREAD_DETACHED)
+      ret = ensure_reaper();
+    if (!ret)
+      ret = pthread_create(&s->thread, &a, thread_trampoline, s);
+    if (!ret) {
+      s->next = threads;
+      threads = s;
+      *thread = s->thread;
+      pthread_cond_signal(&thread_cond);
+    }
+    pthread_mutex_unlock(&thread_lock);
+  }
   pthread_attr_destroy(&a);
-  if (ret != 0)
+  if (ret)
     free(s);
   return ret;
 }
 
 int pthread_join_soloader(pthread_t thread, void **value_ptr) {
-  return pthread_join(thread, value_ptr);
+  if (!thread)
+    return ESRCH;
+  if (pthread_equal(thread, pthread_self()))
+    return EDEADLK;
+  pthread_mutex_lock(&thread_lock);
+  ThreadStart *s = find_thread(thread);
+  int ret = !s ? ESRCH : s->state != THREAD_JOINABLE ? EINVAL : 0;
+  if (!ret)
+    s->state = THREAD_JOINING;
+  pthread_mutex_unlock(&thread_lock);
+  if (ret)
+    return ret;
+  ret = pthread_join(thread, value_ptr);
+  if (!ret)
+    release_thread(s);
+  else {
+    pthread_mutex_lock(&thread_lock);
+    s->state = THREAD_JOINABLE;
+    pthread_mutex_unlock(&thread_lock);
+  }
+  return ret;
 }
-int pthread_detach_soloader(pthread_t thread) { return pthread_detach(thread); }
+
+int pthread_detach_soloader(pthread_t thread) {
+  if (!thread)
+    return ESRCH;
+  pthread_mutex_lock(&thread_lock);
+  ThreadStart *s = find_thread(thread);
+  int ret = !s ? ESRCH : s->state != THREAD_JOINABLE ? EINVAL : ensure_reaper();
+  if (!ret) {
+    s->state = THREAD_DETACHED;
+    pthread_cond_signal(&thread_cond);
+  }
+  pthread_mutex_unlock(&thread_lock);
+  return ret;
+}
+
+void pthread_exit_soloader(void *value) {
+  pthread_mutex_lock(&thread_lock);
+  ThreadStart *s = find_thread(pthread_self());
+  if (s) {
+    s->finished = 1;
+    pthread_cond_signal(&thread_cond);
+  }
+  pthread_mutex_unlock(&thread_lock);
+  pthread_exit(value);
+  __builtin_unreachable();
+}
 pthread_t pthread_self_soloader(void) { return pthread_self(); }
 
 int pthread_equal_soloader(pthread_t t1, pthread_t t2) {
@@ -369,9 +527,11 @@ int pthread_attr_destroy_soloader(pthread_attr_t_bionic *attr) {
 }
 
 int pthread_attr_setdetachstate_soloader(pthread_attr_t_bionic *attr, int state) {
-  if (!attr) return -1;
-  attr_static_init(attr);
-  return pthread_attr_setdetachstate(attr->real_ptr, state);
+  if (!attr || (state != 0 && state != 1)) return EINVAL;
+  int ret = attr_static_init(attr);
+  if (!ret)
+    attr->detached = state; // bionic: JOINABLE=0, DETACHED=1; SDK always joinable
+  return ret;
 }
 
 int pthread_attr_setstacksize_soloader(pthread_attr_t_bionic *attr, size_t stacksize) {

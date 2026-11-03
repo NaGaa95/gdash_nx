@@ -17,7 +17,8 @@
 #define CONFIG_VARS \
   CONFIG_VAR_INT(screen_width); \
   CONFIG_VAR_INT(screen_height); \
-  CONFIG_VAR_INT(cursor_speed);
+  CONFIG_VAR_INT(cursor_speed); \
+  CONFIG_VAR_INT(menu_autosave_interval_seconds);
 
 Config config;
 
@@ -38,6 +39,7 @@ int read_config(const char *file) {
   config.screen_width = -1;  // auto (picks 720p handheld / 1080p docked)
   config.screen_height = -1;
   config.cursor_speed = 900; // stick cursor speed, px/s at 720p
+  config.menu_autosave_interval_seconds = 30;
 
   FILE *f = fopen(file, "r");
   if (f == NULL)

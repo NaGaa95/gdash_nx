@@ -99,6 +99,41 @@ static int count_verified_peers(so_module *module) {
   return count;
 }
 
+static int scene_sets_tag(so_module *module, const char *name, unsigned tag) {
+  for (size_t i=0;i<module->symbol_count;i++) {
+    const TestSymbol *symbol=&module->symbols[i];
+    if (!symbol->section || strcmp(module->strings+symbol->name,name))
+      continue;
+    const uint32_t *code=(const uint32_t *)((uintptr_t)module->load_base+symbol->value);
+    for (size_t word=0;word+1<symbol->size/4;word++) {
+      // mov wN, #tag; str wN, [scene, #28] in the native scene constructor.
+      if ((code[word]&0xffffffe0u)==(0x52800000u|(tag<<5)) &&
+          (code[word+1]&0xffc00000u)==0xb9000000u &&
+          ((code[word+1]>>10)&0xfffu)==7 &&
+          (code[word]&31)==(code[word+1]&31))
+        return 1;
+    }
+  }
+  return 0;
+}
+
+static int calls_native_symbol(so_module *module, const char *caller, const char *callee) {
+  uintptr_t target=so_try_find_addr(module,callee);
+  if (!target) return 0;
+  for (size_t i=0;i<module->symbol_count;i++) {
+    const TestSymbol *symbol=&module->symbols[i];
+    if (!symbol->section || strcmp(module->strings+symbol->name,caller)) continue;
+    const uint32_t *code=(const uint32_t *)((uintptr_t)module->load_base+symbol->value);
+    for (size_t word=0;word<symbol->size/4;word++) {
+      if ((code[word]&0xfc000000u)!=0x94000000u) continue;
+      int64_t offset=code[word]&0x03ffffffu;
+      if (offset&0x02000000) offset-=0x04000000;
+      if ((uintptr_t)((int64_t)(uintptr_t)&code[word]+offset*4)==target) return 1;
+    }
+  }
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc!=3) return 2;
   so_module module;
@@ -106,6 +141,28 @@ int main(int argc, char **argv) {
   game_compat_detect_package(argv[1]);
   CHECK(!strcmp(game_compat_package_name(),argv[2]));
   const int legacy=so_try_find_addr(&module,"_ZN7cocos2d8ZipUtils9hexToCharERKSs")!=0;
+  CHECK(so_try_find_addr(&module,"_ZN11GameManager11doQuickSaveEv")!=0);
+  CHECK(so_try_find_addr(&module,"_ZN17LocalLevelManager11sharedStateEv")!=0);
+  CHECK(so_try_find_addr(&module,"_ZN7cocos2d10CCDirector14sharedDirectorEv")!=0);
+  CHECK(so_try_find_addr(&module,legacy?"_ZN8GManager4saveEv":"_ZN8GManager4saveEb")!=0);
+  CHECK((so_try_find_addr(&module,"_ZN8GManager11waitForSaveEd")!=0)==!legacy);
+  CHECK(game_compat_play_layer_offset(&module)==(legacy?472:544));
+  CHECK(game_compat_running_scene_offset(&module)==(legacy?264:272));
+  if (!legacy) {
+    CHECK(so_try_find_addr(&module,"_ZNSt6__ndk16thread6detachEv")!=0);
+    CHECK(calls_native_symbol(&module,
+        "_ZN8GManager8saveGMToENSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEEb",
+        "_ZNSt6__ndk16thread6detachEv"));
+  }
+  CHECK(scene_sets_tag(&module,"_ZN9MenuLayer5sceneEb",15));
+  CHECK(scene_sets_tag(&module,legacy?"_ZN9PlayLayer5sceneEP11GJGameLevelbb":"_ZN9PlayLayer5sceneEP11GJGameLevelb",5));
+  if (!strcmp(argv[2],"com.robtopx.geometryjump")) {
+    CHECK(scene_sets_tag(&module,"_ZN16LevelEditorLayer5sceneEP11GJGameLevelb",6));
+  } else {
+    const uint32_t *editor=(const uint32_t *)so_try_find_addr(&module,
+        "_ZN16LevelEditorLayer5sceneEP11GJGameLevelb");
+    CHECK(editor && editor[0]==0xd2800000u && editor[1]==0xd65f03c0u); // No editor in free games.
+  }
   if (legacy) {
     CHECK(uses_jni_string_slot(&module,169)); // GetStringUTFChars
     CHECK(uses_jni_string_slot(&module,170)); // ReleaseStringUTFChars

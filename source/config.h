@@ -38,6 +38,7 @@ typedef struct {
   int screen_width;
   int screen_height;
   int cursor_speed;    // pointer speed for the stick-driven cursor, px/s at 720p
+  int menu_autosave_interval_seconds; // 0 disables menu autosave; default 30
 } Config;
 
 extern Config config;

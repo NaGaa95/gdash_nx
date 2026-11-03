@@ -14,4 +14,9 @@ const char *game_compat_package_name(void);
 // back on once a trusted CA bundle is available. Returns patched call sites.
 int game_compat_apply_network(so_module *mod);
 
+// Locate the PlayLayer field through the verified AppDelegate pause routine.
+// Returns -1 for an unknown layout, so automatic saving can safely defer.
+int game_compat_play_layer_offset(so_module *mod);
+int game_compat_running_scene_offset(so_module *mod);
+
 #endif

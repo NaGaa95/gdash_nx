@@ -640,7 +640,7 @@ DynLibFunction dynlib_functions[] = {
   { "pthread_create", (uintptr_t)&pthread_create_soloader },
   { "pthread_detach", (uintptr_t)&pthread_detach_soloader },
   { "pthread_equal", (uintptr_t)&pthread_equal_soloader },
-  { "pthread_exit", (uintptr_t)&pthread_exit },
+  { "pthread_exit", (uintptr_t)&pthread_exit_soloader },
   { "pthread_getschedparam", (uintptr_t)&pthread_getschedparam_soloader },
   { "pthread_getspecific", (uintptr_t)&pthread_getspecific },
   { "pthread_join", (uintptr_t)&pthread_join_soloader },
