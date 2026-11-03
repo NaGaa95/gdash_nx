@@ -136,3 +136,7 @@ condone piracy; users must own a legal copy of the game.
 
 Unless noted otherwise, the source in this repository is under the MIT
 License (see LICENSE).
+
+### SaltyNX telemetry
+
+FPS and render resolution are published to SaltyNX shared memory for compatible overlays. The port continues normally when SaltyNX is not running. This reports presentation timing and resolution; it does not change the game's frame cap.

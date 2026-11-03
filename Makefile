@@ -36,6 +36,9 @@ LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*
 
 # SDL2: audio output (the FMOD AudioTrack sink). EGL/GLESv2/glapi/drm_nouveau:
 # mesa/nouveau GL.
+# Publish all EGL presentation paths, including guest import tables.
+LDFLAGS += -Wl,--wrap=eglSwapBuffers,--wrap=eglGetProcAddress,--wrap=__libnx_exit
+
 LIBS	:= -lSDL2 -lEGL -lGLESv2 -lglapi -ldrm_nouveau \
 		-lnx -lm
 

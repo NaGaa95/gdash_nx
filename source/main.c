@@ -17,6 +17,7 @@
  * of the MIT license.  See the LICENSE file for details.
  */
 
+#include "saltynx.h"
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -620,6 +621,8 @@ static void save_lifecycle_init(void) {
 }
 
 int main(int argc, char **argv) {
+  saltynx_start();
+  atexit(saltynx_stop);
   pthr_pin_render_core();
   cpu_boost(1);
 
