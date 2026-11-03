@@ -13,7 +13,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	$(notdir $(CURDIR))
 APP_TITLE	:=	Geometry Dash
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.0.3
+APP_VERSION	:=	1.0.4
 BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data
