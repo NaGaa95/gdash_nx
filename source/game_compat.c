@@ -1,4 +1,4 @@
-/* game_compat.c -- support for the paid game and its three free variants.
+/* game_compat.c -- support for the paid game and its four free variants.
  *
  * This software may be modified and distributed under the terms
  * of the MIT license. See the LICENSE file for details.
@@ -99,12 +99,7 @@ static int hex_digit_value(unsigned char digit) {
 // with this runtime and crashes while parsing otherwise valid online-level
 // song metadata. The affected build uses the old GNU std::string ABI: a
 // const reference points to an object whose first word is the character data.
-static unsigned char hex_to_char_compat(const void *string_ref) {
-  if (!string_ref)
-    return 0;
-
-  const unsigned char *data = NULL;
-  memcpy(&data, string_ref, sizeof(data));
+static unsigned char decode_hex_byte(const unsigned char *data) {
   if (!data)
     return 0;
 
@@ -117,14 +112,43 @@ static unsigned char hex_to_char_compat(const void *string_ref) {
   return (unsigned char)((high << 4) | low);
 }
 
-static int patch_url_decoder(so_module *mod) {
-  const uintptr_t address = so_try_find_addr(
-      mod, "_ZN7cocos2d8ZipUtils9hexToCharERKSs");
-  if (!address)
+static unsigned char hex_to_char_compat(const void *string_ref) {
+  if (!string_ref)
     return 0;
+  const unsigned char *data = NULL;
+  memcpy(&data, string_ref, sizeof(data));
+  return decode_hex_byte(data);
+}
 
-  hook_arm64(address, (uintptr_t)&hex_to_char_compat);
-  return 1;
+// 2.2.148 uses Android libc++ strings instead. Its disassembly tests bit 0
+// of byte 0: short strings start at byte 1, long strings store data at +16.
+// Keep the two entry points separate: interpreting one ABI as the other can
+// turn a two-byte percent escape into an invalid pointer.
+static unsigned char hex_to_char_libcpp_compat(const void *string_ref) {
+  if (!string_ref)
+    return 0;
+  const unsigned char *object = string_ref;
+  const unsigned char *data = object + 1;
+  if (object[0] & 1)
+    memcpy(&data, object + 2 * sizeof(uintptr_t), sizeof(data));
+  return decode_hex_byte(data);
+}
+
+static int patch_url_decoder(so_module *mod) {
+  int patched = 0;
+  uintptr_t address = so_try_find_addr(
+      mod, "_ZN7cocos2d8ZipUtils9hexToCharERKSs");
+  if (address) {
+    hook_arm64(address, (uintptr_t)&hex_to_char_compat);
+    patched++;
+  }
+  address = so_try_find_addr(mod,
+      "_ZN7cocos2d8ZipUtils9hexToCharERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE");
+  if (address) {
+    hook_arm64(address, (uintptr_t)&hex_to_char_libcpp_compat);
+    patched++;
+  }
+  return patched;
 }
 
 static int patch_public_leaderboard_bootstrap(so_module *mod) {
@@ -134,19 +158,31 @@ static int patch_public_leaderboard_bootstrap(so_module *mod) {
   if (!address)
     return 0;
 
+  const uintptr_t shared_state = so_try_find_addr(
+      mod, "_ZN11GameManager11sharedStateEv");
+  if (!shared_state)
+    return 0;
+
   // On a fresh/anonymous profile the stock client tries updateUserScore()
   // before its first getGJScores20 request. Boomlings rejects that upload
   // without an account, and the failure callback never starts the public
   // leaderboard download. Skip only that decision branch; the existing path
   // immediately below still performs the normal cached/network lookup.
   uint32_t *code = (uint32_t *)address;
-  const uint32_t ldrb_score_uploaded = 0x3948a000u; // ldrb w0, [x0, #552]
+  const uint32_t ldrb_score_uploaded_legacy = 0x3948a000u; // [x0, #552]
+  const uint32_t ldrb_score_uploaded_148 = 0x394a4000u;    // [x0, #656]
   const uint32_t cbz_w0_mask = 0x7f00001fu;
   const uint32_t cbz_w0 = 0x34000000u;
   const uint32_t nop = 0xd503201fu;
-  for (unsigned i = 0; i + 1 < 96; i++) {
-    if (code[i] != ldrb_score_uploaded ||
+  for (unsigned i = 1; i + 1 < 96; i++) {
+    if ((code[i] != ldrb_score_uploaded_legacy &&
+         code[i] != ldrb_score_uploaded_148) ||
         (code[i + 1] & cbz_w0_mask) != cbz_w0)
+      continue;
+    // Both supported layouts read this flag immediately after sharedState().
+    // Check the call target as well as the offset before changing a branch.
+    if (!is_bl(code[i - 1]) ||
+        bl_target((uintptr_t)&code[i - 1], code[i - 1]) != shared_state)
       continue;
     code[i + 1] = nop;
     return 1;

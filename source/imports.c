@@ -371,6 +371,7 @@ DynLibFunction dynlib_functions[] = {
   { "strtol", (uintptr_t)&strtol },
   { "strtold", (uintptr_t)&strtold },
   { "strtoll", (uintptr_t)&strtoll },
+  { "atoll", (uintptr_t)&atoll },
   { "strtoul", (uintptr_t)&strtoul },
   { "strtoull", (uintptr_t)&strtoull },
 

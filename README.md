@@ -6,7 +6,7 @@
 <h1 align=center>Geometry Dash · Switch Port</h1>
 
 A wrapper/port of the Android releases of **Geometry Dash**, **Meltdown**,
-**SubZero**, and **World**. It loads the original arm64 game binaries —
+**SubZero**, **World**, and **Lite**. It loads the original arm64 game binaries —
 `libcocos2dcpp.so` (RobTop's cocos2d-x 2.2 fork + the game) and the stock
 `libfmod.so` — patches them and runs them inside a minimal Android-like
 environment natively on the Switch.
@@ -15,6 +15,15 @@ environment natively on the Switch.
 
 You need a **2.2.14x arm64** Android release; extract the files from your own
 legally-owned copy of the game.
+
+Compatibility has been checked against the supplied **full game 2.2.145**
+arm64 package (code 42), **2.2.148** Meltdown (code 15), SubZero (code 13),
+World (code 15), and Lite (code 44), alongside the older full-game library.
+The port handles both the older GNU and the newer Android libc++ string layouts
+used by these releases.
+
+Use wrapper **v1.0.3 or newer** with these updated packages; it fixes their
+UTF-16 JNI save-path conversion during startup.
 
 Create a separate folder for each game you install and fill it:
 
@@ -36,6 +45,11 @@ save. Split APK/XAPK releases usually store the assets in the base APK and the
 native libraries in `config.arm64_v8a.apk`. An `armeabi-v7a`-only release is
 32-bit and cannot supply libraries for this arm64 port.
 
+For APKMirror `.apkm` bundles, open `base.apk` for `assets/` and
+`split_config.arm64_v8a.apk` for the two game libraries. Keep the assets and
+libraries from the same game/version together. The ad/crash-reporting native
+libraries in the split are not required by this wrapper.
+
 ### Notes
 
 This will not run in applet/album mode — it needs the full memory of a game
@@ -47,6 +61,17 @@ a forwarder.
 * `screen_width` / `screen_height` — render resolution; `-1` auto-picks
   1280x720 handheld / 1920x1080 docked.
 * `cursor_speed` — pointer speed of the stick-driven cursor, px/s at 720p.
+
+### Controls and saves
+
+Either stick moves the menu cursor. **A** touches its last position, including
+after the cursor fades out; it sends one touch, not an extra bottom-right tap.
+**L/R/ZL/ZR** retain the dedicated jump touch. D-pad left/right retain the
+platformer movement zones, and **B/Plus** go back or pause.
+
+The wrapper saves when losing focus (for example, pressing HOME) and on a clean
+in-game exit. It no longer forces a save every 20 seconds during
+rendering. Use HOME to trigger a save before closing the application.
 
 ### Online features
 

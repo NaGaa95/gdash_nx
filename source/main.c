@@ -326,10 +326,10 @@ static PadState pad;
 
 // virtual pointer ids
 enum {
-  VPTR_JUMP   = 20, // A/ZR/R -> tap (jump / menu select at bottom-right)
+  VPTR_JUMP   = 20, // shoulder buttons -> jump tap at bottom-right
   VPTR_LEFT   = 21, // dpad/stick left  -> platformer left arrow zone
   VPTR_RIGHT  = 22, // dpad/stick right -> platformer right arrow zone
-  VPTR_CURSOR = 23, // A press at the stick-driven cursor (menu select)
+  VPTR_CURSOR = 23, // A press at the cursor, including when it is hidden
 };
 
 // Android keycodes
@@ -419,8 +419,9 @@ static void build_virtual_pointers(void) {
   const u64 down = padGetButtons(&pad);
   const float w = (float)screen_width, h = (float)screen_height;
 
-  // jump: tap near the bottom-right corner (any of A / ZR / R / ZL / L)
-  if (down & (HidNpadButton_A | HidNpadButton_ZR | HidNpadButton_R |
+  // Keep dedicated jump buttons separate from A's cursor click. A must never
+  // also touch this corner: it contains the exit door in custom-level menus.
+  if (down & (HidNpadButton_ZR | HidNpadButton_R |
               HidNpadButton_ZL | HidNpadButton_L)) {
     pnew[VPTR_JUMP].active = 1;
     pnew[VPTR_JUMP].x = w - 4.0f;
@@ -440,11 +441,9 @@ static void build_virtual_pointers(void) {
     pnew[VPTR_RIGHT].y = (480.0f / 544.0f) * h;
   }
 
-  // cursor click on A -- but only while the cursor is on screen (i.e. a stick
-  // was moved recently, meaning we're navigating a menu). In gameplay the stick
-  // is idle, the cursor is hidden, and A is purely the jump tap above, so the
-  // natural Switch confirm button never fires a stray tap mid-level.
-  if ((down & HidNpadButton_A) && cursor_visible()) {
+  // Hiding the cursor is visual only. Keep the same contact until A is
+  // released, even if the three-second visibility timer expires while held.
+  if (down & HidNpadButton_A) {
     pnew[VPTR_CURSOR].active = 1;
     pnew[VPTR_CURSOR].x = cursor_x;
     pnew[VPTR_CURSOR].y = cursor_y;
@@ -654,16 +653,13 @@ int main(int argc, char **argv) {
 
   appletHook(&s_applet_hook, applet_focus_hook, NULL);
 
-  unsigned frame = 0;
+  // Forced save work can stall rendering/physics while FMOD keeps playing.
+  // Keep saves in the focus-loss and clean-exit paths, outside gameplay.
   while (appletMainLoop() && !g_quit) {
     update_input();
     gd.render(fake_env, NULL);
     cursor_render();
     eglSwapBuffers(s_dpy, s_surf);
-    if (++frame >= 60 * 20) { // ~20 s autosave
-      frame = 0;
-      force_save();
-    }
   }
 
   if (s_app_focused) { // clean in-game quit; background path already saved

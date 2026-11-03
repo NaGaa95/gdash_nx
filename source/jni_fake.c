@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <string.h>
 #include <switch.h>
@@ -57,7 +58,11 @@ typedef struct {
 
 typedef struct {
   uint32_t tag;
-  char *utf;
+  char *utf;                // normal UTF-8 for the port's C-string callbacks
+  uint16_t *chars;          // immutable UTF-16 storage for GetStringChars
+  int length;              // UTF-16 code units, not UTF-8 bytes
+  char *mutf;               // JNI modified UTF-8 (NUL and surrogates encoded)
+  size_t mutf_length;
 } FakeString;
 
 typedef struct {
@@ -88,10 +93,134 @@ void *jni_make_object(const char *label) {
   return o;
 }
 
-void *jni_make_string(const char *utf) {
+static size_t write_utf8(char *out, uint32_t codepoint) {
+  if (codepoint < 0x80) {
+    out[0] = (char)codepoint;
+    return 1;
+  }
+  if (codepoint < 0x800) {
+    out[0] = (char)(0xc0 | (codepoint >> 6));
+    out[1] = (char)(0x80 | (codepoint & 0x3f));
+    return 2;
+  }
+  if (codepoint < 0x10000) {
+    out[0] = (char)(0xe0 | (codepoint >> 12));
+    out[1] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+    out[2] = (char)(0x80 | (codepoint & 0x3f));
+    return 3;
+  }
+  out[0] = (char)(0xf0 | (codepoint >> 18));
+  out[1] = (char)(0x80 | ((codepoint >> 12) & 0x3f));
+  out[2] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+  out[3] = (char)(0x80 | (codepoint & 0x3f));
+  return 4;
+}
+
+static size_t write_mutf8(char *out, uint16_t unit) {
+  if (!unit) {
+    out[0] = (char)0xc0;
+    out[1] = (char)0x80;
+    return 2;
+  }
+  return write_utf8(out, unit);
+}
+
+static FakeString *make_string_utf16(const uint16_t *chars, int length) {
+  if (length < 0 || (!chars && length) || (size_t)length > (SIZE_MAX - 1) / 3)
+    return NULL;
   FakeString *s = calloc(1, sizeof(*s));
+  if (!s)
+    return NULL;
+  s->chars = malloc(((size_t)length + 1) * sizeof(*s->chars));
+  s->utf = malloc((size_t)length * 3 + 1);
+  s->mutf = malloc((size_t)length * 3 + 1);
+  if (!s->chars || !s->utf || !s->mutf) {
+    free(s->chars);
+    free(s->utf);
+    free(s->mutf);
+    free(s);
+    return NULL;
+  }
   s->tag = TAG_STRING;
-  s->utf = strdup(utf ? utf : "");
+  s->length = length;
+  if (length)
+    memcpy(s->chars, chars, (size_t)length * sizeof(*chars));
+  s->chars[length] = 0;
+  for (int i = 0; i < length; i++)
+    s->mutf_length += write_mutf8(s->mutf + s->mutf_length, chars[i]);
+  s->mutf[s->mutf_length] = 0;
+
+  size_t bytes = 0;
+  for (int i = 0; i < length; i++) {
+    uint32_t cp = chars[i];
+    if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < length &&
+        chars[i + 1] >= 0xdc00 && chars[i + 1] <= 0xdfff) {
+      cp = 0x10000 + ((cp - 0xd800) << 10) + (chars[++i] - 0xdc00);
+    } else if (cp >= 0xd800 && cp <= 0xdfff) {
+      cp = 0xfffd; // retain the unit in JNI; C callbacks receive valid UTF-8
+    }
+    bytes += write_utf8(s->utf + bytes, cp);
+  }
+  s->utf[bytes] = 0;
+  return s;
+}
+
+// Accept normal UTF-8 from the port and JNI's modified UTF-8 from the game.
+// Modified UTF-8 encodes NUL as C0 80 and each surrogate as three bytes.
+static uint32_t read_utf8(const unsigned char **cursor, const unsigned char *end) {
+  unsigned char first = *(*cursor)++;
+  if (first < 0x80)
+    return first;
+  if (first == 0xc0 && *cursor < end && **cursor == 0x80) {
+    (*cursor)++;
+    return 0;
+  }
+  unsigned count;
+  uint32_t cp, minimum;
+  if (first >= 0xc2 && first <= 0xdf) {
+    count = 1; cp = first & 0x1f; minimum = 0x80;
+  } else if (first >= 0xe0 && first <= 0xef) {
+    count = 2; cp = first & 0x0f; minimum = 0x800;
+  } else if (first >= 0xf0 && first <= 0xf4) {
+    count = 3; cp = first & 7; minimum = 0x10000;
+  } else {
+    return 0xfffd;
+  }
+  if ((size_t)(end - *cursor) < count)
+    return 0xfffd;
+  for (unsigned i = 0; i < count; i++) {
+    if (((*cursor)[i] & 0xc0) != 0x80)
+      return 0xfffd;
+    cp = (cp << 6) | ((*cursor)[i] & 0x3f);
+  }
+  *cursor += count;
+  return cp < minimum || cp > 0x10ffff ? 0xfffd : cp;
+}
+
+void *jni_make_string(const char *utf) {
+  if (!utf)
+    utf = "";
+  size_t bytes = strlen(utf);
+  if (bytes > INT_MAX || bytes > SIZE_MAX / sizeof(uint16_t) - 1)
+    return NULL;
+  uint16_t *chars = malloc((bytes + 1) * sizeof(*chars));
+  if (!chars)
+    return NULL;
+  const unsigned char *cursor = (const unsigned char *)utf;
+  const unsigned char *end = cursor + bytes;
+  int length = 0;
+  while (cursor < end) {
+    uint32_t cp = read_utf8(&cursor, end);
+    if (cp > 0xffff) {
+      cp -= 0x10000;
+      chars[length++] = (uint16_t)(0xd800 | (cp >> 10));
+      chars[length++] = (uint16_t)(0xdc00 | (cp & 0x3ff));
+    } else {
+      chars[length++] = (uint16_t)cp;
+    }
+  }
+  FakeString *s = make_string_utf16(chars, length);
+  free(chars);
   return s;
 }
 
@@ -139,10 +268,7 @@ const char *jni_string_utf(void *jstr) {
 }
 
 static const char *obj_str(void *jstr) {
-  FakeString *s = jstr;
-  if (s && s->tag == TAG_STRING)
-    return s->utf;
-  return "";
+  return jni_string_utf(jstr);
 }
 
 // ---------------------------------------------------------------------------
@@ -566,20 +692,40 @@ static juint j_GetBooleanField(void *env, void *obj, FakeID *id) {
 
 // --- strings -----------------------------------------------------------------
 
+static void *j_NewString(void *env, const uint16_t *chars, int length) {
+  (void)env; return make_string_utf16(chars, length);
+}
+static const uint16_t *j_GetStringChars(void *env, void *jstr, uint8_t *is_copy) {
+  (void)env;
+  static const uint16_t empty[] = {0};
+  if (is_copy) *is_copy = 0;
+  FakeString *s = jstr;
+  return s && s->tag == TAG_STRING ? s->chars : empty;
+}
+static void j_ReleaseStringChars(void *env, void *jstr, const uint16_t *chars) {
+  (void)env; (void)jstr; (void)chars; // immutable storage belongs to the string
+}
 static void *j_NewStringUTF(void *env, const char *utf) {
   (void)env; return jni_make_string(utf);
 }
 static const char *j_GetStringUTFChars(void *env, void *jstr, uint8_t *is_copy) {
-  (void)env; if (is_copy) *is_copy = 0; return obj_str(jstr);
+  (void)env;
+  if (is_copy) *is_copy = 0;
+  FakeString *s = jstr;
+  return s && s->tag == TAG_STRING ? s->mutf : "";
 }
 static void j_ReleaseStringUTFChars(void *env, void *jstr, const char *utf) {
   (void)env; (void)jstr; (void)utf;
 }
 static juint j_GetStringUTFLength(void *env, void *jstr) {
-  (void)env; return strlen(obj_str(jstr));
+  (void)env;
+  FakeString *s = jstr;
+  return s && s->tag == TAG_STRING ? s->mutf_length : 0;
 }
 static juint j_GetStringLength(void *env, void *jstr) {
-  (void)env; return strlen(obj_str(jstr));
+  (void)env;
+  FakeString *s = jstr;
+  return s && s->tag == TAG_STRING ? (juint)s->length : 0;
 }
 
 // --- arrays ------------------------------------------------------------------
@@ -656,17 +802,21 @@ static void j_SetPrimArrayRegion(void *env, void *arr, int start, int len, const
 // string regions (some helpers use these instead of Get*Chars)
 static void j_GetStringRegion(void *env, void *jstr, int start, int len, uint16_t *buf) {
   (void)env;
-  const char *s = obj_str(jstr);
-  int slen = (int)strlen(s);
-  for (int i = 0; i < len; i++)
-    buf[i] = (start + i < slen) ? (uint16_t)(unsigned char)s[start + i] : 0;
+  FakeString *s = jstr;
+  if (!s || s->tag != TAG_STRING || !buf || start < 0 || len < 0 ||
+      start > s->length || len > s->length - start)
+    return;
+  memcpy(buf, s->chars + start, (size_t)len * sizeof(*buf));
 }
 static void j_GetStringUTFRegion(void *env, void *jstr, int start, int len, char *buf) {
   (void)env;
-  const char *s = obj_str(jstr);
-  int slen = (int)strlen(s);
+  FakeString *s = jstr;
+  if (!s || s->tag != TAG_STRING || !buf || start < 0 || len < 0 ||
+      start > s->length || len > s->length - start)
+    return;
+  size_t bytes = 0;
   for (int i = 0; i < len; i++)
-    buf[i] = (start + i < slen) ? s[start + i] : 0;
+    bytes += write_mutf8(buf + bytes, s->chars[start + i]);
 }
 
 // NewObject family: hand out a plain fake object (method calls on it
@@ -780,7 +930,10 @@ void jni_init(void) {
   env_table[144] = (void *)j_GetFieldID; // GetStaticFieldID
   env_table[145] = (void *)j_GetObjectField; // GetStaticObjectField
   env_table[150] = (void *)j_GetIntField;    // GetStaticIntField
+  env_table[163] = (void *)j_NewString;
   env_table[164] = (void *)j_GetStringLength;
+  env_table[165] = (void *)j_GetStringChars;
+  env_table[166] = (void *)j_ReleaseStringChars;
   env_table[167] = (void *)j_NewStringUTF;
   env_table[168] = (void *)j_GetStringUTFLength;
   env_table[169] = (void *)j_GetStringUTFChars;
@@ -814,8 +967,8 @@ void jni_init(void) {
   env_table[221] = (void *)j_GetStringUTFRegion;
   env_table[222] = (void *)j_GetPrimArrayElements;     // GetPrimitiveArrayCritical
   env_table[223] = (void *)j_ReleasePrimArrayElements; // ReleasePrimitiveArrayCritical
-  env_table[224] = (void *)j_GetStringUTFChars;        // GetStringCritical (ascii)
-  env_table[225] = (void *)j_ReleaseStringUTFChars;    // ReleaseStringCritical
+  env_table[224] = (void *)j_GetStringChars;           // GetStringCritical
+  env_table[225] = (void *)j_ReleaseStringChars;       // ReleaseStringCritical
   env_table[226] = (void *)j_NewGlobalRef;             // NewWeakGlobalRef
   env_table[227] = (void *)j_DeleteRef;                // DeleteWeakGlobalRef
   env_table[228] = (void *)j_ExceptionCheck;
