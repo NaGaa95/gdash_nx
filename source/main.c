@@ -44,6 +44,9 @@
 
 static void *heap_so_base = NULL;
 static size_t heap_so_limit = 0;
+// size of the general (malloc) heap, captured at setup: libounce's allocator
+// moves fake_heap_start to fake_heap_end once it takes the pages over
+static size_t heap_main_size = 0;
 
 so_module fmod_mod; // libfmod.so   (loaded first: exports feed the game)
 so_module game_mod; // libcocos2dcpp.so
@@ -82,6 +85,7 @@ void __libnx_initheap(void) {
   extern char *fake_heap_end;
   fake_heap_start = (char *)addr;
   fake_heap_end   = (char *)addr + fake_heap_size;
+  heap_main_size = fake_heap_size;
 
   heap_so_base = (char *)addr + fake_heap_size;
   heap_so_base = (void *)ALIGN_MEM((uintptr_t)heap_so_base, 0x1000);
@@ -650,9 +654,9 @@ int main(int argc, char **argv) {
   game_compat_detect_package(path_so_game());
   set_screen_size(config.screen_width, config.screen_height);
 
-  extern char *fake_heap_start;
-  const unsigned heap_mb =
-      (unsigned)(((char *)heap_so_base - fake_heap_start) / (1024 * 1024));
+  const unsigned heap_mb = (unsigned)(heap_main_size / (1024 * 1024));
+  debug_log("heap: %u MB general, %u MB for libraries\n", heap_mb,
+            (unsigned)(heap_so_limit / (1024 * 1024)));
 
   if (heap_mb < 1500)
     fatal_error("Not enough memory (%u MB).\n\n"
