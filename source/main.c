@@ -89,6 +89,11 @@ void __libnx_initheap(void) {
 }
 
 static void check_syscalls(void) {
+#ifdef __SWITCH2__
+  // kaiHEN: code is mapped by its ldr:ro service, not by our own syscalls
+  // (so_util.c checks that service when it first needs it)
+  return;
+#endif
   if (!envIsSyscallHinted(0x77))
     fatal_error("svcMapProcessCodeMemory is unavailable.");
   if (!envIsSyscallHinted(0x78))
@@ -627,6 +632,15 @@ int main(int argc, char **argv) {
   cpu_boost(1);
 
   paths_init(argc > 0 ? argv[0] : NULL);
+#ifdef __SWITCH2__
+  {
+    // OunceVK (Mesa) logs to stderr; keep it next to the .nro
+    char log_path[600];
+    snprintf(log_path, sizeof(log_path), "%s/stderr.log", path_base());
+    freopen(log_path, "w", stderr);
+    debug_log("--- start (Switch 2 / kaiHEN build)\n");
+  }
+#endif
 
   if (read_config(path_config()) < 0)
     write_config(path_config());
@@ -658,6 +672,8 @@ int main(int argc, char **argv) {
   if (so_load(&game_mod, path_so_game(), (char *)heap_so_base + fmod_reserve,
               heap_so_limit - fmod_reserve) < 0)
     fatal_error("Could not load\n%s.", SO_NAME);
+  so_place_all();
+  debug_log("modules: fmod at %p, game at %p\n", fmod_mod.load_virtbase, game_mod.load_virtbase);
 
   update_imports();
 

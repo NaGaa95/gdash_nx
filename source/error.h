@@ -10,5 +10,7 @@
 #define __ERROR_H__
 
 void fatal_error(const char *fmt, ...) __attribute__((noreturn));
+// appends to <game folder>/debug.log
+void debug_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 #endif

@@ -2,6 +2,15 @@
 // Adapted from NaGaa95/Cemu-nx: src/platform/switch/SwitchSaltyNX.cpp.
 #include "saltynx.h"
 
+#ifdef __SWITCH2__
+// SaltyNX (FPSLocker/ReverseNX telemetry) is a Switch 1 Atmosphere sysmodule;
+// kaiHEN has no equivalent, so the hooks are no-ops on Switch 2.
+void saltynx_start(void) {}
+void saltynx_stop(void) {}
+void saltynx_set_resolution(uint32_t, uint32_t) {}
+void saltynx_frame(uint8_t) {}
+#else
+
 #include <switch.h>
 
 #include <algorithm>
@@ -248,3 +257,4 @@ void saltynx_frame(uint8_t api) {
     }
     graphics_api.store(api, std::memory_order_relaxed);
 }
+#endif /* __SWITCH2__ */

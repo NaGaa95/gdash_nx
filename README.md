@@ -11,6 +11,27 @@ A wrapper/port of the Android releases of **Geometry Dash**, **Meltdown**,
 `libfmod.so` — patches them and runs them inside a minimal Android-like
 environment natively on the Switch.
 
+### Switch 2 (kaiHEN)
+
+This fork builds for **Switch 2 running [kaiHEN](https://github.com/ouncebrew/kaihen)**
+by default, using the [ounce-devkit](https://github.com/ouncebrew/ounce-devkit)
+(libounce in place of libnx, OunceVK — NVK + Zink — in place of Switch 1 Mesa).
+The install layout below is the same; launch hbmenu by holding **R** while
+opening a game, then start the port from there.
+
+What differs from the Switch 1 build:
+
+* **Code mapping goes through kaiHEN's `ldr:ro`.** A kaiHEN game process may not
+  call `svcMapProcessCodeMemory` / `svcSetProcessMemoryPermission`, so each
+  Android `.so` is described to RO as an NRO in place (text RX, ro R, data RW)
+  and RO maps it. See the comment above `so_place_all()` in `source/so_util.c`.
+* **SaltyNX** hooks are no-ops (it's a Switch 1 Atmosphere sysmodule).
+* Thread pinning uses whatever cores the process core mask grants instead of
+  assuming Switch 1's four.
+* `debug.log` (loader layout, module addresses, fatal errors) and `stderr.log`
+  (OunceVK/Mesa output) are written next to the `.nro`. Grab these if
+  something breaks on hardware.
+
 ### How to install
 
 You need a **2.2.14x arm64** Android release; extract the files from your own
@@ -59,7 +80,17 @@ Install the devkitPro Switch toolchain and portlibs:
 pacman -S devkitA64 switch-tools libnx switch-sdl2 switch-mesa switch-libdrm_nouveau
 ```
 
-Then `make`.
+For Switch 2, also install the ounce devkit (`libounce`, `ouncevk`,
+`libkaihen`) — run `sh install.sh` from
+[ounce-devkit](https://github.com/ouncebrew/ounce-devkit), or use its Docker image:
+
+```sh
+git clone https://github.com/ouncebrew/ounce-devkit && docker build -t ounce-devkit ounce-devkit
+docker run --rm -v "$PWD:/build/gdash" -w /build/gdash ounce-devkit make
+```
+
+Then `make` for Switch 2, or `make SWITCH1=1` for the original Switch 1 build.
+GitHub Actions (`.github/workflows/build.yml`) builds both and uploads the `.nro`s.
 
 ### Credits
 

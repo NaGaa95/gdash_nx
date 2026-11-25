@@ -7,7 +7,16 @@ $(error "Please set DEVKITPRO in your environment. export DEVKITPRO=<path to>/de
 endif
 
 TOPDIR ?= $(CURDIR)
+
+# Switch 2 (kaiHEN, ounce-devkit/libounce) by default.
+# `make SWITCH1=1` builds the original Switch 1 (libnx + mesa) version.
+ifeq ($(strip $(SWITCH1)),)
+include $(DEVKITPRO)/libounce/switch2_rules
+CPU_ARCH	:=	$(SWITCH2_CPU)
+else
 include $(DEVKITPRO)/libnx/switch_rules
+CPU_ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57
+endif
 
 #---------------------------------------------------------------------------------
 TARGET		:=	$(notdir $(CURDIR))
@@ -22,7 +31,7 @@ INCLUDES	:=	source
 #---------------------------------------------------------------------------------
 # options for code generation
 #---------------------------------------------------------------------------------
-ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
+ARCH	:=	$(CPU_ARCH) -mtp=soft -fPIE
 
 DEFINES	:=	-D__SWITCH__
 
@@ -35,7 +44,9 @@ ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
 # SDL2: audio output (the FMOD AudioTrack sink). EGL/GLESv2/glapi/drm_nouveau:
-# mesa/nouveau GL.
+# mesa/nouveau GL on Switch 1. On Switch 2, switch2_rules puts OunceVK first:
+# its libEGL.a carries EGL + GLES (Zink on NVK) and the other three are empty
+# stand-ins, so the same LIBS line links on both.
 # Publish all EGL presentation paths, including guest import tables.
 LDFLAGS += -Wl,--wrap=eglSwapBuffers,--wrap=eglGetProcAddress,--wrap=__libnx_exit
 

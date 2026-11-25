@@ -64,6 +64,9 @@ uintptr_t so_try_find_addr_rx(so_module *mod, const char *symbol);
 // writable load_base mirror (for patching before so_finalize); 0 when missing
 uintptr_t so_try_find_addr(so_module *mod, const char *symbol);
 DynLibFunction *so_find_import(DynLibFunction *funcs, int num_funcs, const char *name);
+// choose each module's runtime address; call after every so_load and
+// before relocating (a no-op on Switch 1, which reserves in so_load)
+void so_place_all(void);
 void so_finalize(so_module *mod);
 int so_unload(so_module *mod);
 

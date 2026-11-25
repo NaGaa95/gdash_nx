@@ -1,0 +1,39 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: switch2
+            flags: ""
+          - name: switch1
+            flags: "SWITCH1=1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # devkitPro's image plus the Switch 2 devkit (libounce, OunceVK,
+      # libkaihen) from the [ounce] pacman repository.
+      - name: Build the devkit image
+        run: |
+          git clone --depth 1 https://github.com/ouncebrew/ounce-devkit.git /tmp/ounce-devkit
+          docker build -t ounce-devkit /tmp/ounce-devkit
+
+      - name: Build
+        run: |
+          docker run --rm -v "$PWD:/build/gdash" -w /build/gdash ounce-devkit \
+            make -j"$(nproc)" ${{ matrix.flags }}
+          mkdir -p out
+          mv gdash.nro out/gdash_${{ matrix.name }}.nro
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gdash_${{ matrix.name }}
+          path: out/*.nro

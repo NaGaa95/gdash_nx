@@ -139,11 +139,16 @@ static int cond_static_init(pthread_cond_t_bionic *cond, const pthread_condattr_
 // ---------------------------------------------------------------------------
 
 static Mutex core_lock;
-static int core_list[4];
+#define MAX_CORES 8
+static int core_list[MAX_CORES];
 static int core_count = 0;
 static unsigned core_rr = 0;
 
+// Switch 1: core 3 belongs to the system. Switch 2 games get a different set
+// of cores; trust the process core mask there.
+#ifndef __SWITCH2__
 #define HORIZON_RESERVED_CORE 3
+#endif
 
 static void core_init_once(void) {
   if (core_count)
@@ -152,11 +157,13 @@ static void core_init_once(void) {
   if (R_FAILED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) || mask == 0)
     mask = 0x7; // fallback: cores 0,1,2 (typical homebrew allotment)
 
+#ifdef HORIZON_RESERVED_CORE
   const u64 app_mask = mask & ~(1ull << HORIZON_RESERVED_CORE);
   if (app_mask)
     mask = app_mask;
+#endif
 
-  for (int c = 0; c < 4; c++)
+  for (int c = 0; c < MAX_CORES; c++)
     if (mask & (1ull << c))
       core_list[core_count++] = c;
 

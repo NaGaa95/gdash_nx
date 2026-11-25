@@ -54,6 +54,174 @@ void so_free_temp(so_module *mod) {
   mod->so_base = NULL;
 }
 
+#ifdef __SWITCH2__
+/* ---------------------------------------------------------------------------
+ * Switch 2 (kaiHEN): the game process may not call svcMapProcessCodeMemory or
+ * svcSetProcessMemoryPermission itself. kaiHEN's ldr:ro service (RO) has
+ * those syscalls and maps NRO0-shaped images out of our heap for us, with
+ * text RX, ro R and data RW, exactly like libounce's dlopen does.
+ *
+ * So each module is described to RO as an NRO in place: the loaded ELF image
+ * (load_base .. load_base + load_size, already laid out at its link-time
+ * vaddrs) gets an NRO header written over the start of its in-memory ELF
+ * header, and is split into
+ *   text = [0, end of the last executable segment)       -> RX
+ *   ro   = [text end, start of the first writable page)  -> R
+ *   data = [first writable page, load_size)              -> RW
+ * The ELF header and the leading read-only segment therefore end up RX,
+ * which is harmless. If no page lies between the executable and writable
+ * segments, the ro part is taken from the PT_GNU_RELRO pages instead (the
+ * same protection Android's linker gives them after relocation).
+ *
+ * RO chooses the address itself, but its search is deterministic (first fit
+ * from the start of the ASLR region). The modules are therefore mapped once
+ * to learn their addresses (so_place_all), unmapped, relocated for those
+ * addresses, then mapped for real in the same order by so_finalize, which
+ * checks that every module landed where it was relocated for.
+ * ------------------------------------------------------------------------- */
+
+#define NRO_MAGIC 0x304f524eu // "NRO0"
+
+static int ro_ready = 0;
+
+static void so_ro_init(void) {
+  if (ro_ready)
+    return;
+  Result rc = ldrRoInitialize();
+  if (R_FAILED(rc))
+    fatal_error("Error: kaiHEN's ldr:ro service is unavailable (%08x).\n\n"
+                "Start this port from hbmenu under kaiHEN\n"
+                "(hold R while opening a game).", rc);
+  ro_ready = 1;
+}
+
+static void so_nro_layout(so_module *mod, u32 *text_size, u32 *ro_size, u32 *data_size) {
+  u64 text_end = 0, rw_start = mod->load_size;
+  u64 relro_start = 0, relro_end = 0;
+  for (int i = 0; i < mod->phnum; i++) {
+    const Elf64_Phdr *p = &mod->phdr[i];
+    if (p->p_type == PT_GNU_RELRO) {
+      relro_start = p->p_vaddr & ~0xFFFull;
+      relro_end = (p->p_vaddr + p->p_memsz) & ~0xFFFull;
+    }
+    if (p->p_type != PT_LOAD)
+      continue;
+    if (p->p_flags & PF_X) {
+      const u64 end = ALIGN_MEM(p->p_vaddr + p->p_memsz, 0x1000);
+      if (end > text_end) text_end = end;
+    }
+    if (p->p_flags & PF_W) {
+      const u64 start = p->p_vaddr & ~0xFFFull;
+      if (start < rw_start) rw_start = start;
+    }
+  }
+
+  if (!text_end || rw_start >= mod->load_size)
+    fatal_error("Error: %s has no executable or no writable segment.", mod->name);
+  if (rw_start < text_end)
+    fatal_error("Error: %s shares a page between code and data\n(%llx < %llx); "
+                "this layout cannot be mapped on Switch 2.",
+                mod->name, (unsigned long long)rw_start, (unsigned long long)text_end);
+
+  u64 data_start = rw_start;
+  if (rw_start == text_end) {
+    // no free page between code and data: use the RELRO pages as the ro part
+    if (relro_start == rw_start && relro_end > rw_start && relro_end < mod->load_size)
+      data_start = relro_end;
+    else
+      fatal_error("Error: %s has no read-only pages between its code\n"
+                  "and data; this layout cannot be mapped on Switch 2.", mod->name);
+  }
+
+  *text_size = (u32)text_end;
+  *ro_size = (u32)(data_start - text_end);
+  *data_size = (u32)(mod->load_size - data_start);
+  debug_log("so: %s text %x ro %x data %x%s\n", mod->name, *text_size, *ro_size, *data_size,
+              rw_start == text_end ? " (relro read-only)" : "");
+}
+
+// writes the NRO0 header that RO reads over the image's in-memory ELF header
+static void so_write_nro_header(so_module *mod) {
+  u32 text, ro, data;
+  so_nro_layout(mod, &text, &ro, &data);
+
+  uint8_t *h = (uint8_t *)mod->load_base;
+  const u32 fields[] = {
+    NRO_MAGIC,             // 0x10 magic
+    0,                     // 0x14 version
+    (u32)mod->load_size,   // 0x18 image size
+    0,                     // 0x1c flags
+    0, text,               // 0x20 text offset, size
+    text, ro,              // 0x28 ro offset, size
+    text + ro, data,       // 0x30 data offset, size
+    0,                     // 0x38 bss size (bss is inside the image)
+    0,                     // 0x3c reserved
+  };
+  memcpy(h + 0x10, fields, sizeof(fields));
+
+  // module id: unique per module so RO doesn't refuse a "duplicate"
+  uint8_t id[32];
+  uint64_t hash = 0xcbf29ce484222325ull;
+  for (const char *c = mod->name; *c; c++)
+    hash = (hash ^ (uint8_t)*c) * 0x100000001b3ull;
+  for (int i = 0; i < 4; i++) {
+    hash = (hash ^ (uint64_t)mod->load_size) * 0x100000001b3ull;
+    memcpy(id + i * 8, &hash, 8);
+  }
+  memcpy(h + 0x40, id, sizeof(id));
+}
+
+static Result so_ro_map(so_module *mod, u64 *out_base) {
+  return ldrRoLoadNro(out_base, (u64)mod->load_base, mod->load_size, 0, 0);
+}
+
+static void so_set_virtbase(so_module *mod, void *virtbase) {
+  mod->load_virtbase = virtbase;
+  for (int i = 0; i < mod->elf_hdr->e_phnum; i++)
+    mod->prog_hdr[i].p_vaddr = mod->phdr[i].p_vaddr + (Elf64_Addr)virtbase;
+}
+
+void so_place_all(void) {
+  so_ro_init();
+
+  // map every module once, in load order, keeping each mapped so the next
+  // one lands after it; this is exactly what so_finalize will do later
+  for (so_module *m = so_list; m; m = m->next) {
+    so_write_nro_header(m);
+    u64 base = 0;
+    Result rc = so_ro_map(m, &base);
+    if (R_FAILED(rc))
+      fatal_error("Error: ldr:ro could not map %s\n(probe, %08x).", m->name, rc);
+    so_set_virtbase(m, (void *)base);
+  }
+  for (so_module *m = so_list; m; m = m->next) {
+    Result rc = ldrRoUnloadNro((u64)m->load_virtbase);
+    if (R_FAILED(rc))
+      fatal_error("Error: ldr:ro could not unmap %s\n(probe, %08x).", m->name, rc);
+  }
+}
+
+void so_finalize(so_module *mod) {
+  so_ro_init();
+  so_write_nro_header(mod); // relocation never touches it; rewrite to be safe
+
+  u64 base = 0;
+  Result rc = so_ro_map(mod, &base);
+  if (R_FAILED(rc))
+    fatal_error("Error: ldr:ro could not map %s:\n%08x", mod->name, rc);
+  if (base != (u64)mod->load_virtbase) {
+    ldrRoUnloadNro(base);
+    fatal_error("Error: ldr:ro mapped %s at %p,\nnot at %p where it was relocated for.",
+                mod->name, (void *)base, mod->load_virtbase);
+  }
+}
+
+#else /* Switch 1 */
+
+void so_place_all(void) {
+  // the address is reserved in so_load already
+}
+
 void so_finalize(so_module *mod) {
   Result rc = 0;
 
@@ -101,6 +269,8 @@ void so_finalize(so_module *mod) {
 
   free(is_x_page);
 }
+
+#endif /* __SWITCH2__ */
 
 int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
   int res = 0;
@@ -165,11 +335,17 @@ int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
   if (!mod->load_base) goto err_free_so;
   memset(mod->load_base, 0, mod->load_size);
 
+#ifndef __SWITCH2__
   // reserve virtual memory space for the entire LOAD zone
   virtmemLock();
   mod->load_virtbase = virtmemFindCodeMemory(mod->load_size, 0x1000);
   mod->load_memrv = virtmemAddReservation(mod->load_virtbase, mod->load_size);
   virtmemUnlock();
+#else
+  // ldr:ro picks the address; so_place_all() fills load_virtbase in
+  mod->load_virtbase = NULL;
+  mod->load_memrv = NULL;
+#endif
 
   // copy segments to where they belong, then fix up the runtime phdrs to
   // point into the virtual address space
@@ -214,9 +390,11 @@ int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
   return 0;
 
 err_free_load:
+#ifndef __SWITCH2__
   virtmemLock();
   virtmemRemoveReservation(mod->load_memrv);
   virtmemUnlock();
+#endif
 err_free_so:
   free(mod->so_base);
   mod->so_base = NULL;
@@ -453,6 +631,9 @@ int so_unload(so_module *mod) {
     so_free_temp(mod);
   }
 
+#ifdef __SWITCH2__
+  ldrRoUnloadNro((u64)mod->load_virtbase);
+#else
   // remap everything as RW
   for (int i = 0; i < mod->phnum; i++) {
     const Elf64_Phdr *p = &mod->phdr[i];
@@ -469,6 +650,7 @@ int so_unload(so_module *mod) {
   virtmemLock();
   virtmemRemoveReservation(mod->load_memrv);
   virtmemUnlock();
+#endif
 
   // remove from list
   if (so_list == mod) {

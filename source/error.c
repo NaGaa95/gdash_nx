@@ -14,6 +14,20 @@
 
 #include "util.h"
 #include "error.h"
+#include "paths.h"
+
+void debug_log(const char *fmt, ...) {
+  char path[600];
+  snprintf(path, sizeof(path), "%s/debug.log", path_base());
+  FILE *f = fopen(path, "a");
+  if (!f)
+    return;
+  va_list list;
+  va_start(list, fmt);
+  vfprintf(f, fmt, list);
+  va_end(list);
+  fclose(f);
+}
 
 void fatal_error(const char *fmt, ...) {
   PadState pad;
@@ -26,6 +40,13 @@ void fatal_error(const char *fmt, ...) {
   va_start(list, fmt);
   vprintf(fmt, list);
   va_end(list);
+
+  // keep a copy on the SD card: on hardware it is the easiest thing to share
+  char msg[1024];
+  va_start(list, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, list);
+  va_end(list);
+  debug_log("fatal: %s\n", msg);
 
   printf("\n\nPress A to exit.");
 
